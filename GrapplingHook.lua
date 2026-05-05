@@ -1,4 +1,8 @@
--- discord: @sillyrelshy | roblox: @sillyrelshy
+-- Discord: @sillyrelshy | Roblox: @sillyrelshy
+-- This LocalScript owns the client side of the grapple tool: input, aiming,
+-- hook visuals, and character movement are kept together so the tool responds
+-- immediately for the player using it.
+-- soz if i overexplain, last application got rejected because I didn't add enough comments ;c
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -15,7 +19,9 @@ local sndFire = handle:FindFirstChild("Fire")
 local sndHit  = handle:FindFirstChild("Hit")
 local sndConnect = handle:FindFirstChild("Connect")
 
--- capped values stop the pull from building endless speed
+-- These values separate range, visual speed, pull strength, and safety limits.
+-- The pull is velocity capped instead of spring based, because shortening a
+-- rope every frame can add energy and make the player accelerate forever.
 local MAX_RANGE       = 180
 local TRAVEL_SPEED    = 280
 local PULL_SPEED      = 70
@@ -32,7 +38,8 @@ local HOOK_COLOR = Color3.fromRGB(180, 180, 190)
 local HOOK_SIZE  = Vector3.new(0.4, 0.4, 1.4)
 
 
--- each hook object belongs to one character
+-- Hook uses a metatable so each character gets its own state, visuals, physics
+-- helper, and event connections without mixing data between respawns.
 local Hook = {}
 Hook.__index = Hook
 
@@ -49,11 +56,13 @@ function Hook.new(char)
 	self.equipped = false
 	self.conns    = {}
 
+	-- LinearVelocity is created once per character and disabled until a shot lands.
+	-- Reusing it avoids inserting new movers during rapid shots, and it gives
+	-- grounded horizontal pulls enough force to beat floor friction.
 	local att = Instance.new("Attachment")
 	att.Name = "GrapplePullAttachment"
 	att.Parent = self.root
 
-	-- linearvelocity helps level pulls work while grounded
 	local lv = Instance.new("LinearVelocity")
 	lv.Name = "GrapplePullVelocity"
 	lv.Attachment0 = att
@@ -74,6 +83,8 @@ function Hook.new(char)
 end
 
 
+-- The rope and projectile are client-side visuals only, so they are anchored,
+-- non-colliding, and created lazily when the tool is first fired.
 function Hook:ensureVisuals()
 	if not self.rope then
 		local p = Instance.new("Part")
@@ -105,10 +116,14 @@ function Hook:ensureVisuals()
 end
 
 
+-- The rope is drawn as one thin Part. CFrame.lookAt handles direction, the
+-- midpoint places it between the endpoints, and Size.Z becomes the rope length.
 function Hook:drawLine(part, a, b)
 	local d = b - a
 	local mag = d.Magnitude
 	if mag < 0.001 then
+		-- If the endpoints overlap, lookAt has no direction to face, so the rope
+		-- is collapsed for that frame instead of using an invalid orientation.
 		part.Size = Vector3.new(part.Size.X, part.Size.Y, 0)
 		return
 	end
@@ -117,7 +132,8 @@ function Hook:drawLine(part, a, b)
 end
 
 
--- camera ray keeps the hook lined up with the crosshair
+-- Aiming from the camera matches the crosshair instead of the character body.
+-- The ray excludes the character and hook visuals so the tool cannot hit itself.
 function Hook:aim()
 	local mouse = plr:GetMouse()
 	local origin = cam.CFrame.Position
@@ -131,6 +147,8 @@ function Hook:aim()
 end
 
 
+-- Fire is guarded by equipped, cooldown, and state checks so input spam cannot
+-- start multiple hook tweens at the same time.
 function Hook:fire()
 	if not self.equipped then return end
 	local t = os.clock()
@@ -143,6 +161,7 @@ function Hook:fire()
 	local origin = ropeAtt.WorldPosition
 	local hit = self:aim()
 	if not hit then
+		-- Misses still animate to max range so failed shots have readable feedback.
 		local mouse = plr:GetMouse()
 		local target = origin + (mouse.Hit.Position - origin).Unit * MAX_RANGE
 		self:flyHook(origin, target, false)
@@ -152,6 +171,8 @@ function Hook:fire()
 end
 
 
+-- TweenService only moves the visible hook head. Player movement starts later,
+-- after the tween reaches a confirmed hit point and calls attach.
 function Hook:flyHook(from, to, didHit)
 	self.state = "firing"
 	self:ensureVisuals()
@@ -162,11 +183,13 @@ function Hook:flyHook(from, to, didHit)
 	local dist = (to - from).Magnitude
 	local time = math.max(dist / TRAVEL_SPEED, 0.05)
 
-	-- tweening the hook head makes the shot readable
+	-- Time is based on distance, so close and far shots share one travel speed.
 	local tw = TS:Create(self.projectile, TweenInfo.new(time, Enum.EasingStyle.Linear), {
 		CFrame = CFrame.lookAt(to, to + (to - from).Unit)
 	})
 
+	-- The callback disconnects itself because each tween belongs to one shot.
+	-- Without that, respawning during flight could leave an old listener alive.
 	local c
 	c = tw.Completed:Connect(function()
 		c:Disconnect()
@@ -177,6 +200,8 @@ function Hook:flyHook(from, to, didHit)
 end
 
 
+-- Attach switches from projectile travel to player movement. PlatformStand stays
+-- off so the humanoid does not ragdoll; LinearVelocity handles the pull instead.
 function Hook:attach(point)
 	self.state = "attached"
 	self.anchor = point
@@ -187,6 +212,8 @@ function Hook:attach(point)
 end
 
 
+-- Retract is shared by mouse release, misses, arrival, and unequip. It disables
+-- movement first, hides visuals, then returns the tool to idle.
 function Hook:retract()
 	self.state = "retracting"
 	self.anchor = nil
@@ -204,6 +231,8 @@ function Hook:retract()
 end
 
 
+-- Heartbeat runs after the current physics step. Updating here gives the next
+-- frame a clean target velocity and keeps the rope synced with the moving tool.
 function Hook:bindStep()
 	local c = RunService.Heartbeat:Connect(function(dt)
 		if self.state == "attached" then
@@ -217,41 +246,53 @@ function Hook:bindStep()
 end
 
 
+-- pullStep is the movement solver. It measures the player-to-anchor vector,
+-- checks arrival, then adjusts only the velocity pointing along the rope.
 function Hook:pullStep(dt)
 	if not self.anchor then return end
 
 	local toAnchor = self.anchor - self.root.Position
 	local dist = toAnchor.Magnitude
-	-- reaching the anchor drops the rope automatically
+	-- Arrival is checked before pulling so the player releases cleanly instead
+	-- of overshooting and orbiting around the anchor.
 	if dist <= ARRIVE_DIST then
 		self:retract()
 		return
 	end
 
 	local dir = toAnchor / dist
-	-- flat grounded pulls get a little lift so friction does not pin the player
+	-- A level rope can be blocked by ground friction. If the player is on the
+	-- floor and the anchor is nearly horizontal, this small upward bias unsticks
+	-- the humanoid without using PlatformStand.
 	if self.hum.FloorMaterial ~= Enum.Material.Air and dir.Y < FLAT_PULL_Y then
 		dir = (dir + Vector3.yAxis * GROUND_LIFT).Unit
 	end
 
 	local velocity = self.root.AssemblyLinearVelocity
 	local vAlong = velocity:Dot(dir)
-	-- keep the sideways swing
+	-- Splitting velocity preserves sideways motion, so the player keeps a swing
+	-- arc while only the inward rope-axis speed is pushed toward PULL_SPEED.
 	local sideVelocity = velocity - dir * vAlong
 
 	local maxStep = PULL_ACCEL * dt
 	local newAlong = math.min(PULL_SPEED, vAlong + maxStep)
 	local newVelocity = sideVelocity + dir * newAlong
 
+	-- The total speed cap catches outside momentum from slopes, moving parts, or
+	-- repeated hooks before it turns into runaway velocity.
 	if newVelocity.Magnitude > MAX_SWING_SPEED then
 		newVelocity = newVelocity.Unit * MAX_SWING_SPEED
 	end
 
+	-- LinearVelocity keeps pushing against floor friction, while setting the root
+	-- velocity directly makes the response immediate on the current frame.
 	self.lv.VectorVelocity = newVelocity
 	self.root.AssemblyLinearVelocity = newVelocity
 end
 
 
+-- The rope starts from the live barrel attachment every frame, so tool and
+-- character animations do not visually detach it from the handle.
 function Hook:drawRope()
 	if not self.rope then return end
 	local from = ropeAtt.WorldPosition
@@ -267,6 +308,8 @@ function Hook:drawRope()
 end
 
 
+-- destroy clears connections before removing visuals and constraints. This
+-- matters on respawn because old Heartbeat callbacks should not control a dead body.
 function Hook:destroy()
 	for _, c in ipairs(self.conns) do c:Disconnect() end
 	self.conns = {}
@@ -281,6 +324,7 @@ function Hook:destroy()
 end
 
 
+-- Each respawn gets a fresh Hook tied to the new HumanoidRootPart.
 local active
 local function onChar(c)
 	if active then active:destroy() end
@@ -291,6 +335,8 @@ if plr.Character then onChar(plr.Character) end
 plr.CharacterAdded:Connect(onChar)
 
 
+-- Mouse down is only bound while equipped, so normal clicks cannot fire a
+-- grapple that is sitting in the backpack.
 local mouseDownConn
 
 tool.Equipped:Connect(function()
@@ -316,6 +362,8 @@ tool.Unequipped:Connect(function()
 	end
 end)
 
+-- Mouse release stays global because the player may release after the hook has
+-- attached or during a quick unequip.
 UIS.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 then
 		if active and active.state == "attached" then
